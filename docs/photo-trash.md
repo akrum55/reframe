@@ -38,7 +38,9 @@ distinction explicit. Do not use it when you want recoverable removal.
 - `.photo-trash/` is private runtime data alongside `photos/` and
   `dithered_photos/`. Never add it to Git or a source-only deployment archive.
   Include all three directories in private photo/recovery backups while services
-  are stopped. The dashboard updater includes Trash in its user-data backup list.
+  are stopped. The dashboard updater lists Trash as preserved user data, but
+  its automatic backup copies **settings only**, not photos or Trash. Make the
+  complete private photo backup separately before any update or rollback.
 - Each entry has a durable journal containing the photo ID, time, expected
   filenames, sizes, and SHA256 hashes. Intent is recorded before moving files;
   interrupted moves are resumed at startup. SHA256/size checks reject replaced
