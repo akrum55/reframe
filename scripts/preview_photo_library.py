@@ -25,6 +25,11 @@ from photo_trash_api import register_photo_trash_routes
 def make_preview(base, port):
     originals, processed = base / 'photos', base / 'dithered_photos'
     store = PhotoTrash(originals, processed, base / '.photo-trash')
+    # Fixed sample SD capacity, never the host Mac's disk. Account for the
+    # synthetic fixture files so Empty Trash demonstrates released space.
+    store.storage_status = lambda: {
+        'total_bytes': 32_000_000_000, 'used_bytes': 8_000_000_000 + sum(p.stat().st_size for p in base.rglob('*') if p.is_file()),
+        'available_bytes': 24_000_000_000 - sum(p.stat().st_size for p in base.rglob('*') if p.is_file())}
     colors = ['#dc8b57', '#9aaa86', '#839bb6', '#d9b35e', '#a48dab', '#8da6a0']
     for index in range(16):
         image = Image.new('RGB', (600, 400), colors[index % len(colors)])
@@ -75,8 +80,10 @@ def make_preview(base, port):
             return JSONResponse({'enabled': False})
         if path == '/api/settings' and request.method == 'GET':
             return JSONResponse(dashboard.settings_manager.load_settings())
-        allowed_get = path.startswith(('/assets/', '/photos/', '/dithered/', '/api/trash', '/preview-hardware/')) or path == '/api/photos'
+        allowed_get = path.startswith(('/assets/', '/photos/', '/dithered/', '/api/trash', '/preview-hardware/')) or path in {'/api/photos', '/api/storage'}
         allowed_post = path in {'/api/photos/trash', '/api/trash/restore', '/api/timeout/reset',
+                               '/api/trash/empty', '/api/trash/empty/preview',
+                               '/preview-hardware/api/trash/empty', '/preview-hardware/api/trash/empty/preview',
                                '/preview-hardware/api/photos/trash', '/preview-hardware/api/trash/restore',
                                '/preview-hardware/api/timeout/reset'}
         if (request.method == 'GET' and allowed_get) or (request.method == 'POST' and allowed_post):

@@ -1,10 +1,17 @@
-/* Austin's reversible selection UI. No image data or selection is persisted in
+/* Austin's selection, Trash, restore, and confirmed-empty UI. No image data or selection is persisted in
  * browser storage. Reload-safe recovery lives in the camera's Trash journal. */
 (function (root) {
     'use strict';
     const escapeHtml = value => String(value).replace(/[&<>"']/g, ch => ({
         '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
     })[ch]);
+    const storageLabel = data => {
+        const total = data.total_bytes, free = data.available_bytes;
+        if (!Number.isFinite(total) || total <= 0 || !Number.isFinite(free) || free < 0 || free > total)
+            return 'SD storage: unavailable';
+        const format = bytes => bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : `${(bytes / 1e6).toFixed(1)} MB`;
+        return `SD storage: ${format(free)} available / ${format(total)} total`;
+    };
 
     class PhotoSelection {
         constructor() { this.ids = new Set(); }
@@ -49,6 +56,10 @@
                 this.trashView = action === 'trash';
                 this.selecting = this.trashView;
                 this.selection.clear();
+                if (this.trashView) {
+                    this.undoIds = [];
+                    this.setNotice('');
+                }
                 this.renderToolbar();
                 if (this.trashView) await this.loadTrash();
                 else await this.options.reload();
@@ -70,6 +81,8 @@
                 }
             } else if (action === 'restore') {
                 await this.restore([...this.selection.ids]);
+            } else if (action === 'empty') {
+                await this.emptyTrash();
             }
         }
 
@@ -105,7 +118,8 @@
                     + button('clear', 'clear selection', !n)
                     + button(this.trashView ? 'restore' : 'move', this.trashView ? 'restore selected' : 'move to trash', !n);
             }
-            if (this.trashView) this.toolbar.innerHTML += '<p class="library-help">Photos stay here until you restore them. Nothing is automatically deleted. Trash still uses camera storage.</p>';
+            if (this.trashView) this.toolbar.innerHTML += button('empty', 'empty trash', !this.trashPhotos.length)
+                + '<p class="library-help">Restore photos to keep them, or empty Trash to permanently delete them. Nothing is automatically deleted. Trash still uses camera storage.</p>';
             else if (this.selecting) this.toolbar.innerHTML += '<p class="library-help">Tap photos to select them. Selections stay selected across pages (up to 100).</p>';
         }
 
@@ -125,7 +139,7 @@
                 return `<button type="button" class="photo-choice" role="checkbox" aria-checked="${selected}" aria-label="${escapeHtml(label)}" data-photo-choice="${escapeHtml(photo.id)}" ${this.busy ? 'disabled' : ''}>
                     <img src="${escapeHtml(src)}" alt="" loading="lazy">
                     <span class="photo-check" aria-hidden="true">${selected ? '✓' : ''}</span>
-                    <span class="photo-choice-caption">${escapeHtml(label)}${date ? `<br>trashed ${escapeHtml(date)}` : ''}${photo.needs_attention ? '<br>interrupted operation — try restore' : ''}</span>
+                    <span class="photo-choice-caption">${escapeHtml(label)}${date ? `<br>trashed ${escapeHtml(date)}` : ''}${photo.needs_attention ? (photo.state === 'purging' ? '<br>deletion interrupted — empty Trash to finish; cannot restore' : '<br>interrupted operation — try restore') : ''}</span>
                 </button>`;
             }).join('');
             grid.querySelectorAll('[data-photo-choice]').forEach(button => {
@@ -158,6 +172,41 @@
             if (ids.length) await this.mutate('/api/trash/restore', [...ids], true, undo);
         }
 
+        async emptyTrash() {
+            if (this.busy || !this.trashView) return;
+            this.busy = true;
+            this.render(this.options.grid());
+            this.setNotice('Checking Trash...');
+            const headers = {'Content-Type': 'application/json', 'X-Reframe-Action': 'photo-library'};
+            try {
+                const prepared = await fetch('/api/trash/empty/preview', {method: 'POST', headers, body: '{}'});
+                const plan = await prepared.json();
+                if (!prepared.ok) throw new Error(plan.detail || 'Could not check Trash.');
+                if (!plan.total) { this.setNotice('Trash is already empty.'); return; }
+                if (!confirm(`Permanently delete all ${plan.total} photo${plan.total === 1 ? '' : 's'} in Trash? Both originals and processed copies will be deleted from the camera. This cannot be undone. Photos in your main gallery will not be deleted.`)) {
+                    this.setNotice('');
+                    return;
+                }
+                this.setNotice('Emptying Trash...');
+                const response = await fetch('/api/trash/empty', {method: 'POST', headers,
+                    body: JSON.stringify({snapshot: plan.snapshot, confirmation: 'empty-trash-permanently'})});
+                const result = await response.json();
+                if (!response.ok) throw new Error(result.detail || 'Could not empty Trash.');
+                this.undoIds = [];
+                this.selection.clear();
+                this.setNotice(`${result.completed.length} photo${result.completed.length === 1 ? '' : 's'} permanently deleted.`
+                    + (result.failed.length ? ` ${result.failed.length} could not be fully deleted: ${result.failed[0].error}` : ' Trash is empty.'));
+            } catch (error) {
+                this.setNotice(`${error.message} If interrupted, check Trash before retrying. Deletions already completed cannot be undone.`);
+            } finally {
+                this.busy = false;
+                await this.loadTrash();
+                if (this.options.updateStorage) await this.options.updateStorage();
+                this.renderToolbar();
+                this.setNotice(this.message);
+            }
+        }
+
         async mutate(url, ids, restoring, undo = false) {
             if (this.busy || !ids.length) return;
             this.busy = true;
@@ -188,6 +237,7 @@
                 this.busy = false;
                 if (this.trashView) await this.loadTrash();
                 else await this.options.reload();
+                if (this.options.updateStorage) await this.options.updateStorage();
                 this.renderToolbar();
                 this.setNotice(this.message);
             }
@@ -195,5 +245,6 @@
     }
 
     root.PhotoLibrary = PhotoLibrary;
-    if (typeof module !== 'undefined') module.exports = {PhotoSelection, escapeHtml, PhotoLibrary};
+    root.storageLabel = storageLabel;
+    if (typeof module !== 'undefined') module.exports = {PhotoSelection, escapeHtml, PhotoLibrary, storageLabel};
 })(typeof window !== 'undefined' ? window : globalThis);

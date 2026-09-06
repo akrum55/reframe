@@ -1,4 +1,4 @@
-"""Camera-local, recoverable photo-pair trash. No purge or cloud storage.
+"""Camera-local photo-pair Trash, restore, and explicitly confirmed emptying.
 
 Only the hardware service writes this store, under its operation lock. A
 durable per-photo journal precedes any moves. Link/unlink moves never overwrite
@@ -11,6 +11,7 @@ import hashlib
 import os
 import re
 import stat
+import shutil
 import threading
 import time
 import uuid
@@ -155,7 +156,7 @@ class PhotoTrash:
                 entry = json.loads(manifest.read_text())
                 validate_ids([entry["photo_id"]])
                 _require(entry["id"] == folder.name and entry["version"] == 1)
-                _require(entry["state"] in {"moving", "trashed", "restoring", "restored"})
+                _require(entry["state"] in {"moving", "trashed", "restoring", "restored", "purging", "purged"})
                 _require(isinstance(entry["trashed_at"], (int, float)))
                 _require(isinstance(entry["files"], list) and 1 <= len(entry["files"]) <= 9)
                 seen = set()
@@ -228,8 +229,87 @@ class PhotoTrash:
 
     def list_entries(self):
         with self.lock:
-            return sorted((self._public(e) for e in self._entries() if e["state"] != "restored"),
+            return sorted((self._public(e) for e in self._entries() if e["state"] not in {"restored", "purged"}),
                           key=lambda e: e["trashed_at"], reverse=True)
+
+    def storage_status(self):
+        usage = shutil.disk_usage(self.originals)
+        return {"total_bytes": usage.total, "used_bytes": usage.used, "available_bytes": usage.free}
+
+    def _empty_plan(self):
+        entries = sorted((e for e in self._entries() if e["state"] not in {"restored", "purged"}),
+                         key=lambda e: e['id'])
+        if any(e['state'] not in {'trashed', 'purging'} for e in entries):
+            raise TrashError('An interrupted move or restore needs attention before emptying Trash.')
+        snapshot = hashlib.sha256(json.dumps(entries, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        return entries, {"snapshot": snapshot, "total": len(entries)}
+
+    def empty_preview(self):
+        with self.lock:
+            return self._empty_plan()[1]
+
+    def _purge_paths(self, entry):
+        """Preflight a WHOLE entry; never return an active-gallery path."""
+        if entry['state'] not in {'trashed', 'purging'}:
+            raise TrashError('This entry is not eligible for permanent deletion.')
+        folder = self.root / entry['id']
+        if self.root.is_symlink() or folder.is_symlink():
+            raise TrashError('Unsafe Trash folder; nothing further was deleted.')
+        allowed = {'manifest.json', 'manifest.tmp', 'original', 'processed'}
+        if any(p.name not in allowed for p in folder.iterdir()):
+            raise TrashError('Unexpected Trash contents; preserve this folder for recovery.')
+        temporary = folder / 'manifest.tmp'
+        _regular(temporary)  # Reject a symlink/device; a leftover regular journal is safe.
+        for kind, active_folder in (('original', self.originals), ('processed', self.processed)):
+            if active_folder.is_symlink() or not active_folder.is_dir():
+                raise TrashError('Unsafe active photo folder.')
+            allowed_active = self._allowed(entry['photo_id'], kind)
+            if any(p.stem + p.suffix.lower() in allowed_active for p in active_folder.iterdir()):
+                raise TrashError('This photo also exists in the active gallery. Nothing was deleted.')
+            saved_folder = folder / kind
+            if saved_folder.is_symlink() or not saved_folder.is_dir():
+                raise TrashError('Unsafe Trash folder; preserve it for recovery.')
+            expected = {f['name'] for f in entry['files'] if f['kind'] == kind}
+            if any(p.name not in expected for p in saved_folder.iterdir()):
+                raise TrashError('Unexpected file in Trash; nothing was deleted.')
+        paths = []
+        for item in entry['files']:
+            _, saved = self._paths(entry, item)
+            if not _regular(saved):
+                if entry['state'] != 'purging':
+                    raise TrashError('A Trash file is missing; preserve this folder for recovery.')
+                continue  # Only a durable previous purge may explain missing files.
+            info = saved.stat()
+            if info.st_nlink != 1 or info.st_size != item['size'] or _fingerprint(saved) != item['sha256']:
+                raise TrashError('A Trash file changed or has other links. Nothing further was deleted.')
+            paths.append(saved)
+        return paths
+
+    def empty(self, snapshot):
+        with self.lock:
+            entries, plan = self._empty_plan()
+            if not isinstance(snapshot, str) or snapshot != plan['snapshot']:
+                raise TrashError('Trash changed. Review its contents and confirm Empty Trash again.')
+            # Validate every entry before committing any irreversible action.
+            for entry in entries:
+                self._purge_paths(entry)
+            completed, failed = [], []
+            for index, entry in enumerate(entries):
+                try:
+                    paths = self._purge_paths(entry)
+                    entry['state'] = 'purging'
+                    self._journal(entry)  # Durable intent before the first unlink.
+                    for path in paths:
+                        path.unlink()
+                        _sync_dir(path.parent)
+                    entry['state'] = 'purged'
+                    self._journal(entry)  # Retain ID reservation; never reuse the numeric ID.
+                    completed.append(self._public(entry))
+                except (OSError, TrashError):
+                    failed = [{"id": e['id'], "error": 'Deletion interrupted. Some files may already be permanently deleted; review Trash and confirm again to finish.'}
+                              for e in entries[index:]]
+                    break
+            return {"success": not failed, "completed": completed, "failed": failed}
 
     def move_to_trash(self, photo_ids):
         ids = validate_ids(photo_ids)
@@ -294,6 +374,8 @@ class PhotoTrash:
                     entry = entries.get(entry_id)
                     if not entry:
                         raise TrashError("Trash entry not found. Refresh and try again.")
+                    if entry['state'] in {'purging', 'purged'}:
+                        raise TrashError('Permanent deletion has started. This photo cannot be restored.')
                     if entry["state"] != "restored":
                         entry["state"] = "restoring"
                         self._journal(entry)
@@ -307,7 +389,7 @@ class PhotoTrash:
     def preview(self, entry_id):
         validate_ids([entry_id], entries=True)
         with self.lock:
-            entry = next((e for e in self._entries() if e["id"] == entry_id and e["state"] != "restored"), None)
+            entry = next((e for e in self._entries() if e["id"] == entry_id and e["state"] not in {"restored", "purging", "purged"}), None)
             if not entry:
                 raise TrashError("Trash entry not found.")
             for item in sorted(entry["files"], key=lambda f: f["kind"] != "processed"):

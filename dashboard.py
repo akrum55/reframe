@@ -836,11 +836,11 @@ async def photo_library_asset(filename: str):
     return FileResponse(os.path.join(BASE_PATH, "static", filename), headers={"Cache-Control": "no-cache"})
 
 
-async def library_proxy(path, ids=None):
+async def library_proxy(path, ids=None, payload=None):
     try:
-        if ids is None:
+        if ids is None and payload is None:
             return await reframe_client.get(path)
-        return await reframe_client.post(path, json={"ids": ids})
+        return await reframe_client.post(path, json={"ids": ids} if payload is None else payload)
     except httpx.HTTPStatusError as error:
         try:
             detail = error.response.json().get("detail", "Camera could not complete this action.")
@@ -854,6 +854,42 @@ async def library_proxy(path, ids=None):
 @app.get("/api/trash")
 async def dashboard_list_trash():
     return await library_proxy("/trash")
+
+
+@app.get('/api/storage')
+async def dashboard_storage():
+    return await library_proxy('/storage')
+
+
+async def dashboard_empty_mutation(request, preview=False):
+    global library_mutation_active
+    if request.headers.get('X-Reframe-Action') != 'photo-library':
+        raise HTTPException(403, 'Use the dashboard Empty Trash control.')
+    payload = {}
+    if not preview:
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict) or payload.get('confirmation') != 'empty-trash-permanently' or not isinstance(payload.get('snapshot'), str):
+                raise ValueError()
+        except ValueError:
+            raise HTTPException(400, 'Explicit confirmation and a current Trash snapshot are required.') from None
+    if library_mutation_active or download_job_active or delete_job_active:
+        raise HTTPException(409, 'A library operation or photo export is running. Wait, then try again.')
+    library_mutation_active = True
+    try:
+        return await library_proxy('/trash/empty/preview' if preview else '/trash/empty', payload=payload)
+    finally:
+        library_mutation_active = False
+
+
+@app.post('/api/trash/empty/preview')
+async def dashboard_empty_preview(request: Request):
+    return await dashboard_empty_mutation(request, preview=True)
+
+
+@app.post('/api/trash/empty')
+async def dashboard_empty_trash(request: Request):
+    return await dashboard_empty_mutation(request)
 
 
 @app.get("/api/trash/{entry_id}/preview")
@@ -1562,6 +1598,9 @@ async def dashboard():
                     <span id="battery-level">battery: --%</span>
                 </div>
                 <div class="status-item">
+                    <span id="storage-info" title="Includes system files, active photos, Trash, and other data on the photo-storage filesystem.">SD storage: checking...</span>
+                </div>
+                <div class="status-item">
                     <span id="photo-count">loading photos...</span>
                 </div>
                 <div class="status-item">
@@ -1833,6 +1872,7 @@ async def dashboard():
                 cancelLoads: () => { latestPhotoLoadRequest++; },
                 hidePagination: () => { document.getElementById('pagination').style.display = 'none'; },
                 activity: () => notifyUserActivity(),
+                updateStorage: () => updateStorageInfo(),
                 updateCount: async () => {
                     const response = await fetch('/api/photos?page=1&limit=1');
                     if (response.ok) {
@@ -3095,13 +3135,26 @@ async def dashboard():
                 loadPhotos(currentPage);
                 updateAutoRefreshInterval();
                 updateBatteryLevel();
+                updateStorageInfo();
                 
                 // Add event listener for dithering method changes
                 document.getElementById('dithering-method').addEventListener('change', toggleOrderedSettings);
                 
                 // Update battery level every 30 seconds
                 setInterval(updateBatteryLevel, 30000);
+                setInterval(updateStorageInfo, 30000);
             });
+
+            async function updateStorageInfo() {
+                const element = document.getElementById('storage-info');
+                try {
+                    const response = await fetch('/api/storage', {cache: 'no-store'});
+                    if (!response.ok) throw new Error('Storage unavailable');
+                    element.textContent = storageLabel(await response.json());
+                } catch (error) {
+                    element.textContent = 'SD storage: unavailable';
+                }
+            }
 
             window.addEventListener('beforeunload', function(event) {
                 const modal = document.getElementById('settings-modal');
