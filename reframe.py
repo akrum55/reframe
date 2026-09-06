@@ -59,6 +59,10 @@ def _lazy_import_fastapi():
 import threading
 import time
 
+# Austin's software-only triple-press QR shortcut, 2026-09-05.
+from button_gestures import ButtonGestureRecognizer
+from button_actions import ButtonActionDispatcher
+
 # ═══════════════════════════════════════════════════════════════════
 # HARDWARE: Display — defaults to Waveshare 4" ePaper Spectra 6
 # The driver lives in waveshare_epd/. To use a different e-ink display,
@@ -288,7 +292,7 @@ class CameraManager:
                     "auto_refresh_interval": 30,
                     "auto_timeout_minutes": 10,
                     "auto_timeout_enabled": True,
-                    "show_dashboard_qr_on_wifi_connect": True
+                    "show_dashboard_qr_on_wifi_connect": False
                 }
             }
 
@@ -1365,7 +1369,7 @@ class CameraSystem:
                 system_settings = self.camera_manager.settings.get("system", {})
                 enabled = system_settings.get(
                     "show_dashboard_qr_on_wifi_connect",
-                    system_settings.get("show_dashboard_qr_on_first_network", True)
+                    system_settings.get("show_dashboard_qr_on_first_network", False)
                 )
                 if not enabled:
                     last_connection_ip = get_lan_ip_address()
@@ -1803,11 +1807,16 @@ def main():
             return bool(reg_val & 0x01)  # Check the least significant bit
         except Exception as e:
             logging.error("Failed to read I2C: %s", e)
-            return False
+            # A failed read is not a release. Cancel the gesture and require
+            # a clean released state before accepting a new press.
+            return None
 
-    prev_state = False
-    button_press_start_time = None
-    LONG_PRESS_THRESHOLD = 2.0  # 2 seconds threshold for long press
+    button_gestures = ButtonGestureRecognizer()
+    button_actions = ButtonActionDispatcher(
+        _operation_lock, camera_system.eink_display.is_busy,
+        {"capture": camera_system.capture_photo_api,
+         "qr": camera_system.display_dashboard_qr_api},
+        camera_system.update_activity)
 
     # Start API server in background
     try:
@@ -1817,47 +1826,33 @@ def main():
     _start_api_server_in_background(host="127.0.0.1", port=port)
     camera_system.start_dashboard_qr_monitor()
 
-    logging.info("System initialized. API server running. Waiting for button press to capture photo...")
-    logging.info(f"Button protection: Long press (>={LONG_PRESS_THRESHOLD}s) will not trigger photo capture")
+    logging.info("Button: single tap + 0.5s pause = photo; triple tap = dashboard QR; double tap = no action")
+    logging.info("Holds >=2s remain reserved for PiSugar shutdown; busy presses are discarded")
 
     try:
         while True:
             current_state = is_power_button_pressed()
 
-            # Button press started
-            if current_state and not prev_state:
-                button_press_start_time = time.monotonic()
-                logging.info("Button pressed - monitoring for long press protection...")
-
-            # Button released
-            elif not current_state and prev_state:
-                if button_press_start_time is not None:
-                    press_duration = time.monotonic() - button_press_start_time
-
-                    if press_duration < LONG_PRESS_THRESHOLD:
-                        # Block captures while display is mid-refresh to avoid
-                        # invisible captures with no visual feedback
-                        if camera_system.eink_display.is_busy():
-                            logging.info(f"Short press detected ({press_duration:.1f}s) - display busy, ignoring")
-                        else:
-                            logging.info(f"Short press detected ({press_duration:.1f}s) - capturing photo...")
-                            with _operation_lock:
-                                result = camera_system.capture_photo_api()
-                            if result.get("success"):
-                                logging.info("Photo captured%s.", " and sent to display" if camera_system.camera_manager.settings.get("display", {}).get("auto_display", True) else "")
-                            else:
-                                logging.error("Capture failed: %s", result.get("message", "unknown error"))
-                    else:
-                        logging.info(f"Long press detected ({press_duration:.1f}s) - ignoring for photo capture")
-
-                    button_press_start_time = None
-
-            prev_state = current_state
+            # Never block I2C sampling on a capture or the long e-paper
+            # refresh. Discard partial gestures while hardware/API work runs.
+            if button_actions.is_busy():
+                button_gestures.reset()
+                button_gestures.update(current_state, time.monotonic())
+            else:
+                action = button_gestures.update(current_state, time.monotonic())
+                if action and not button_actions.submit(action):
+                    logging.info("Button action discarded because hardware is busy: %s", action)
+                    button_gestures.reset()
             sleep(BUTTON_POLL_INTERVAL_SECONDS)
     except KeyboardInterrupt:
         logging.info("Program interrupted by user. Exiting...")
     finally:
         bus.close()
+        # Wait for this button worker before cleanup. Upstream capture may
+        # still have separate background save/display threads; this is not
+        # a complete graceful-shutdown implementation. Stop only when idle.
+        # PiSugar's native shutdown configuration remains unchanged.
+        button_actions.wait()
         try:
             # Stop timeout monitor and put display to sleep if initialized inside CameraSystem
             if camera_system:

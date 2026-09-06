@@ -161,7 +161,7 @@ class SettingsManager:
                 "auto_refresh_interval": 30,
                 "auto_timeout_minutes": 10,
                 "auto_timeout_enabled": True,
-                "show_dashboard_qr_on_wifi_connect": True,
+                "show_dashboard_qr_on_wifi_connect": False,  # Austin: manual QR by default
                 "camera_name": ""
             },
             "exports": {
@@ -1656,7 +1656,7 @@ async def dashboard():
                                 <option value="false">disabled</option>
                             </select>
                         </div>
-                        <div class="setting-help">Shows the numeric dashboard address whenever the camera connects or reconnects.</div>
+                        <div class="setting-help">Optional automatic QR on connection. Disabled by default in this custom build: use three short button presses for QR; one press takes a photo after a 0.5-second pause. Two presses do nothing; long-press shutdown is unchanged.</div>
                     </div>
                     <div class="setting-group">
                         <button class="button" onclick="showDashboardQr()" type="button">show dashboard QR</button>
@@ -2289,7 +2289,7 @@ async def dashboard():
                 document.getElementById('auto-refresh-interval').value = settings.system.auto_refresh_interval;
                 document.getElementById('auto-timeout-enabled').value = settings.system.auto_timeout_enabled ? 'true' : 'false';
                 document.getElementById('auto-timeout-minutes').value = settings.system.auto_timeout_minutes || 10;
-                document.getElementById('show-dashboard-qr-on-wifi-connect').value = settings.system.show_dashboard_qr_on_wifi_connect !== false ? 'true' : 'false';
+                document.getElementById('show-dashboard-qr-on-wifi-connect').value = settings.system.show_dashboard_qr_on_wifi_connect === true ? 'true' : 'false';
                 const exportSettings = settings.exports || {};
                 document.getElementById('upscale-dithered-2x').value = exportSettings.upscale_dithered_2x ? 'true' : 'false';
                 document.getElementById('update-status').textContent = 'Updates code, dependencies, and service files while preserving settings and photos.';
@@ -2479,7 +2479,7 @@ async def dashboard():
                                 auto_refresh_interval: 30,
                                 auto_timeout_enabled: true,
                                 auto_timeout_minutes: 10,
-                                show_dashboard_qr_on_wifi_connect: true
+                                show_dashboard_qr_on_wifi_connect: false
                             },
                             exports: {
                                 upscale_dithered_2x: false

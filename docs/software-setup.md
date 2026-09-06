@@ -50,7 +50,9 @@ By default, PiSugar 3 ships with accidental-touch prevention enabled. In that mo
 
 - **single press while off** = power on
 - **startup** = automatically take and display one photo
-- **single press while on** = take a new photo
+- **single short press while on** = take a new photo after a 0.5-second pause
+- **three short presses while on** = display the dashboard QR without taking a photo (no more than 0.5 seconds between taps)
+- **two short presses** = no action, so an incomplete QR shortcut does not take a photo
 - **long press while on** = shut down
 - **10 minutes of inactivity** = automatic shutdown to prevent battery drain
 
@@ -67,6 +69,8 @@ echo "get anti_mistouch" | nc -q 0 127.0.0.1 8423
 ```
 
 > **Note:** reFrame reads the button directly via I2C (address `0x57`) for photo capture. PiSugar still handles battery monitoring, one-press power-on, and long-press shutdown.
+
+> **Custom build — Austin, September 5, 2026:** triple-press recognition is a local software modification, not an upstream feature. Let the button settle released after boot or an operation. Presses during a capture/display/API operation are ignored, not queued; try again when the display has finished. Holding the button for two seconds or longer cancels pending taps and leaves shutdown to PiSugar. An accidental fourth rapid tap after a triple is ignored until the button has been released for 0.5 seconds. The startup photo is unchanged. See `docs/triple-press-qr.md` for deployment and verification boundaries.
 
 ### PiSugar RTC
 
@@ -139,7 +143,7 @@ To use the camera without a WiFi network, enable your phone's hotspot. As long a
 
 On iPhone, you can find your hotspot name under Settings → General → About → Name. Enable **Maximize Compatibility** in hotspot settings for the Pi to connect reliably.
 
-Whenever the camera connects or reconnects to WiFi, it shows a dashboard QR code on the ePaper display. The network watcher remains active after startup, and the QR encodes the numeric IP when one is available so it also works on hotspots that do not resolve `.local` hostnames. This behavior is enabled by default and can be disabled under system settings in the dashboard.
+In this custom build, automatic QR on WiFi connection/reconnection is disabled by default. Use three short button presses while the camera is ready to request the QR, or the existing manual dashboard QR button. The QR encodes the numeric IP when available, which helps on hotspots that do not resolve `.local` hostnames. Your phone must already be on the same network. If no usable network address exists, the request leaves the screen unchanged and takes no photo. The original automatic behavior remains an opt-in system setting; deployment must explicitly disable it in existing settings because changing a default does not change a saved value.
 
 On Android/Pixel hotspots, `.local` hostnames may not resolve reliably. In that case, use the QR code's numeric IP URL, for example `http://192.168.x.x`.
 
