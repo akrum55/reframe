@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from starlette.background import BackgroundTask
 import httpx
 from PIL import Image
+from photo_trash import TrashError, validate_ids
 
 CAMERA_AVAILABLE = False
 
@@ -27,7 +28,7 @@ BASE_PATH = os.path.dirname(os.path.realpath(__file__))
 PHOTOS_PATH = os.path.join(BASE_PATH, "photos")
 DITHERED_PHOTOS_PATH = os.path.join(BASE_PATH, "dithered_photos")
 SETTINGS_PATH = os.path.join(BASE_PATH, "settings.json")
-USER_DATA_PATHS = ["settings.json", "photos", "dithered_photos"]
+USER_DATA_PATHS = ["settings.json", "photos", "dithered_photos", ".photo-trash"]
 UPDATE_HELPER_PATH = "/usr/local/sbin/reframe-apply-update"
 UPDATE_PENDING_PATH = os.path.join(BASE_PATH, ".runtime", "update_pending")
 
@@ -823,6 +824,82 @@ extension_registry = ExtensionRegistry([ArenaExtension()])
 REFRAME_API_BASE = os.environ.get("REFRAME_API_BASE", "http://127.0.0.1:8077/api")
 reframe_client = ReframeClient(REFRAME_API_BASE)
 
+# Mutations reserve this before any await. Download-all reserves its own flag
+# before its first await too, preventing a check/start race in this process.
+library_mutation_active = False
+
+
+@app.get("/assets/{filename}")
+async def photo_library_asset(filename: str):
+    if filename not in {"photo-library.js", "photo-library.css"}:
+        raise HTTPException(404, "Asset not found")
+    return FileResponse(os.path.join(BASE_PATH, "static", filename), headers={"Cache-Control": "no-cache"})
+
+
+async def library_proxy(path, ids=None):
+    try:
+        if ids is None:
+            return await reframe_client.get(path)
+        return await reframe_client.post(path, json={"ids": ids})
+    except httpx.HTTPStatusError as error:
+        try:
+            detail = error.response.json().get("detail", "Camera could not complete this action.")
+        except ValueError:
+            detail = "Camera could not complete this action."
+        raise HTTPException(error.response.status_code, detail) from None
+    except httpx.RequestError:
+        raise HTTPException(503, "Camera connection interrupted. Check Trash before retrying.") from None
+
+
+@app.get("/api/trash")
+async def dashboard_list_trash():
+    return await library_proxy("/trash")
+
+
+@app.get("/api/trash/{entry_id}/preview")
+async def dashboard_trash_preview(entry_id: str):
+    try:
+        validate_ids([entry_id], entries=True)
+        async with httpx.AsyncClient(timeout=reframe_client.timeout) as client:
+            response = await client.get(f"{reframe_client.base_url}/trash/{entry_id}/preview")
+            response.raise_for_status()
+        return Response(response.content, media_type=response.headers.get("content-type", "image/png"),
+                        headers={"Cache-Control": "no-store"})
+    except TrashError as error:
+        raise HTTPException(400, str(error)) from None
+    except httpx.HTTPError:
+        raise HTTPException(404, "Preview unavailable. Refresh Trash and try again.") from None
+
+
+async def dashboard_library_mutation(request, restore=False):
+    global library_mutation_active
+    # A cross-site HTML form cannot send this custom header. Do not enable
+    # permissive CORS for these camera-local write endpoints.
+    if request.headers.get("X-Reframe-Action") != "photo-library":
+        raise HTTPException(403, "Use the dashboard photo selection controls.")
+    try:
+        body = await request.json()
+        ids = validate_ids(body.get("ids") if isinstance(body, dict) else None, entries=restore)
+    except (ValueError, TrashError) as error:
+        raise HTTPException(400, str(error) if isinstance(error, TrashError) else "Invalid selection.") from None
+    if library_mutation_active or download_job_active or delete_job_active:
+        raise HTTPException(409, "A library operation or photo export is running. Wait, then try again.")
+    library_mutation_active = True
+    try:
+        return await library_proxy("/trash/restore" if restore else "/photos/trash", ids)
+    finally:
+        library_mutation_active = False
+
+
+@app.post("/api/photos/trash")
+async def dashboard_move_to_trash(request: Request):
+    return await dashboard_library_mutation(request)
+
+
+@app.post("/api/trash/restore")
+async def dashboard_restore_photos(request: Request):
+    return await dashboard_library_mutation(request, restore=True)
+
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
     """Serve the main dashboard interface."""
@@ -833,6 +910,7 @@ async def dashboard():
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
         <title>Reframe</title>
+        <link rel="stylesheet" href="/assets/photo-library.css">
         <style>
             :root {
                 --primary-color: #F5F1F0;  /* background */
@@ -1495,6 +1573,8 @@ async def dashboard():
             </div>
             
             <div class="gallery">
+                <div id="library-toolbar" class="library-toolbar" aria-label="Photo library actions"></div>
+                <div id="library-notice" class="library-notice" role="status" aria-live="polite" hidden></div>
                 <div id="photo-grid" class="photo-grid">
                     <div class="loading">loading photos...</div>
                 </div>
@@ -1725,13 +1805,15 @@ async def dashboard():
                         <button class="button danger-btn" onclick="abortDownload()" id="abort-btn" style="display: none;">abort download</button>
                     </div>
                     <div id="delete-controls">
-                        <button class="button danger-btn" onclick="deleteAllPhotos()">delete all photos</button>
+                        <button class="button danger-btn" onclick="deleteAllPhotos()">permanently delete all active photos</button>
+                        <small>Cannot be undone. For recoverable removal, use select photos → move to trash in the gallery.</small>
                         <button class="button danger-btn" onclick="abortDelete()" id="abort-delete-btn" style="display: none;">abort deletion</button>
                     </div>
                 </div>
             </div>
         </div>
         
+        <script src="/assets/photo-library.js"></script>
         <script>
             let photos = [];
             let pagination = {};
@@ -1743,6 +1825,23 @@ async def dashboard():
             let settingsFormSnapshot = null;
             let settingsPageScrollY = 0;
             const photosPerPage = 12;  // Show 12 photos per page
+            const photoLibrary = new PhotoLibrary({
+                photos: () => photos,
+                grid: () => document.getElementById('photo-grid'),
+                render: () => renderGallery(),
+                reload: () => loadPhotos(currentPage),
+                cancelLoads: () => { latestPhotoLoadRequest++; },
+                hidePagination: () => { document.getElementById('pagination').style.display = 'none'; },
+                activity: () => notifyUserActivity(),
+                updateCount: async () => {
+                    const response = await fetch('/api/photos?page=1&limit=1');
+                    if (response.ok) {
+                        const data = await response.json();
+                        pagination.total_photos = data.pagination.total_photos;
+                        updatePhotoCount();
+                    }
+                }
+            });
             
             // Function to notify backend of user activity
             async function notifyUserActivity() {
@@ -1754,6 +1853,7 @@ async def dashboard():
             }
             
             async function loadPhotos(page = currentPage) {
+                if (photoLibrary.trashView) return photoLibrary.loadTrash();
                 const requestedPage = Math.max(1, parseInt(page, 10) || 1);
                 const requestId = ++latestPhotoLoadRequest;
                 try {
@@ -1825,6 +1925,7 @@ async def dashboard():
 
             function renderGallery() {
                 const grid = document.getElementById('photo-grid');
+                if (photoLibrary.render(grid)) return;
                 
                 if (photos.length === 0) {
                     grid.innerHTML = '<div class="loading">no photos found. capture your first photo!</div>';
@@ -2800,12 +2901,12 @@ async def dashboard():
             }
             
             async function deleteAllPhotos() {
-                const confirmed = confirm('⚠️ This will permanently delete ALL photos from the system. This action cannot be undone. Are you absolutely sure?');
+                const confirmed = confirm('⚠️ This will permanently delete ALL active gallery photos, bypassing Trash. This cannot be undone. Existing Trash entries are not affected. Are you absolutely sure?');
                 if (!confirmed) {
                     return;
                 }
                 
-                const doubleConfirmed = confirm('Final confirmation: Delete ALL photos? This will remove both original and dithered versions.');
+                const doubleConfirmed = confirm('Final confirmation: Permanently delete ALL active gallery photos? This removes original and dithered versions without recovery.');
                 if (!doubleConfirmed) {
                     return;
                 }
@@ -2937,7 +3038,7 @@ async def dashboard():
                     const deleteBtn = document.querySelector('button[onclick="deleteAllPhotos()"]');
                     const abortDeleteBtn = document.getElementById('abort-delete-btn');
                     if (deleteBtn) {
-                        deleteBtn.textContent = 'delete all photos';
+                        deleteBtn.textContent = 'permanently delete all active photos';
                         deleteBtn.disabled = false;
                         deleteBtn.style.opacity = '1';
                     }
@@ -2971,7 +3072,7 @@ async def dashboard():
                         // Reset delete button after a short delay
                         setTimeout(() => {
                             if (deleteBtn) {
-                                deleteBtn.textContent = 'delete all photos';
+                                deleteBtn.textContent = 'permanently delete all active photos';
                                 deleteBtn.disabled = false;
                                 deleteBtn.style.opacity = '1';
                             }
@@ -3456,15 +3557,17 @@ download_job_active = False
 # Global variable to track delete progress
 delete_progress = {"status": "idle", "processed": 0, "total": 0, "message": ""}
 delete_abort = False
+delete_job_active = False
 
 @app.post("/api/photos/download-all/start")
 async def start_download_all(background_tasks: BackgroundTasks):
     """Start the download process and return immediately."""
     global download_progress, download_job_active
     
-    if download_job_active or download_progress.get("status") in {"preparing", "creating", "completed", "downloading"}:
+    if library_mutation_active or delete_job_active or download_job_active or download_progress.get("status") in {"preparing", "creating", "completed", "downloading"}:
         raise HTTPException(status_code=409, detail="A photo download is already in progress")
 
+    download_job_active = True
     try:
         # Get all photos from hardware service
         all_photos = await reframe_client.get("/photos")
@@ -3489,6 +3592,7 @@ async def start_download_all(background_tasks: BackgroundTasks):
         return {"status": "started", "total_photos": len(all_photos)}
         
     except HTTPException:
+        download_job_active = False
         raise
     except Exception as e:
         download_job_active = False
@@ -3580,14 +3684,15 @@ def create_zip_file(all_photos, temp_path):
 
             try:
                 original_path = photo.get("original_path")
-                if original_path and os.path.exists(original_path):
-                    zip_file.write(original_path, f"original/{os.path.basename(original_path)}")
+                if not original_path:
+                    raise FileNotFoundError("Original photo unavailable")
+                zip_file.write(original_path, f"original/{os.path.basename(original_path)}")
 
                 dithered_path = photo.get("dithered_path")
-                if dithered_path and os.path.exists(dithered_path):
+                if dithered_path:
                     zip_file.write(dithered_path, f"dithered/{os.path.basename(dithered_path)}")
             except Exception as e:
-                print(f"Error adding photo {photo.get('id', 'unknown')} to ZIP: {e}")
+                raise RuntimeError("Photo library changed or a file could not be read. Refresh and export again.") from e
 
             if download_abort:
                 return False
@@ -3654,7 +3759,7 @@ async def create_zip_background(all_photos):
 
 async def delete_photos_background(all_photos):
     """Background task to delete photos."""
-    global delete_progress, delete_abort
+    global delete_progress, delete_abort, delete_job_active
     import asyncio
     
     try:
@@ -3701,17 +3806,25 @@ async def delete_photos_background(all_photos):
     except Exception as e:
         delete_progress["status"] = "error"
         delete_progress["message"] = f"Error: {str(e)}"
+    finally:
+        delete_job_active = False
 
 @app.post("/api/photos/delete-all/start")
 async def start_delete_all(background_tasks: BackgroundTasks):
     """Start the delete process and return immediately."""
-    global delete_progress
+    global delete_progress, delete_job_active
+    if library_mutation_active or download_job_active or delete_job_active:
+        raise HTTPException(409, "A photo library operation is already running")
+    delete_job_active = True
+    delete_progress = {"status": "preparing", "processed": 0, "total": 0, "message": "Preparing deletion..."}
     
     try:
         # Get all photos from hardware service
         all_photos = await reframe_client.get("/photos")
         
         if not all_photos:
+            delete_progress["status"] = "completed"
+            delete_job_active = False
             return {"status": "completed", "message": "No photos to delete", "deleted_count": 0}
         
         # Initialize progress
@@ -3730,6 +3843,7 @@ async def start_delete_all(background_tasks: BackgroundTasks):
         return {"status": "started", "total_photos": len(all_photos)}
         
     except Exception as e:
+        delete_job_active = False
         delete_progress = {"status": "error", "processed": 0, "total": 0, "message": str(e)}
         raise HTTPException(status_code=500, detail=f"Failed to start deletion: {str(e)}")
 
@@ -3755,6 +3869,10 @@ async def abort_delete():
 @app.post("/api/photos/delete-all")
 async def delete_all_photos():
     """Delete all photos from the system."""
+    global library_mutation_active
+    if library_mutation_active or download_job_active or delete_job_active:
+        raise HTTPException(409, "A photo library operation is already running")
+    library_mutation_active = True
     try:
         # Get all photos from hardware service
         all_photos = await reframe_client.get("/photos")
@@ -3782,6 +3900,8 @@ async def delete_all_photos():
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete photos: {str(e)}")
+    finally:
+        library_mutation_active = False
 
 if __name__ == "__main__":
     import uvicorn

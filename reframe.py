@@ -62,6 +62,7 @@ import time
 # Austin's software-only triple-press QR shortcut, 2026-09-05.
 from button_gestures import ButtonGestureRecognizer
 from button_actions import ButtonActionDispatcher
+from photo_trash import PhotoTrash, PendingPhotoSaves, validate_ids
 
 # ═══════════════════════════════════════════════════════════════════
 # HARDWARE: Display — defaults to Waveshare 4" ePaper Spectra 6
@@ -948,11 +949,13 @@ class FileManager:
         os.makedirs(save_path, exist_ok=True)
         os.makedirs(processed_path, exist_ok=True)
         self._id_lock = threading.Lock()
+        self.pending_saves = PendingPhotoSaves()
+        self.trash = PhotoTrash(save_path, processed_path, os.path.join(os.path.dirname(save_path), ".photo-trash"))
         self._next_photo_index = self._find_next_photo_index()
 
     def _find_next_photo_index(self):
         """Seed the monotonic photo counter from numeric filenames on disk."""
-        highest_index = -1
+        highest_index = self.trash.highest_reserved_index()
         try:
             for filename in os.listdir(self.save_path):
                 stem, extension = os.path.splitext(filename)
@@ -1038,6 +1041,7 @@ class FileManager:
 
     def delete_photo(self, photo_id):
         """Delete both original and processed versions of a photo."""
+        validate_ids([photo_id])
         deleted_files = []
 
         # Delete original
@@ -1462,8 +1466,7 @@ class CameraSystem:
                     except Exception as e:
                         logging.error(f"Error saving photo outputs: {e}")
 
-                save_thread = threading.Thread(target=_save_outputs, daemon=True)
-                save_thread.start()
+                self.file_manager.pending_saves.start(_save_outputs)
 
             return result
 
@@ -1560,6 +1563,21 @@ def _create_fastapi_routes():
         return None
 
     app = FastAPI(title="Reframe Hardware API")
+
+    # Austin's reversible photo library operations. Hardware owns all moves;
+    # the dashboard never bypasses the operation/save/display guards.
+    from photo_trash_api import register_photo_trash_routes
+
+    def get_trash_store():
+        if camera_system is None:
+            raise HTTPException(status_code=503, detail="Camera system not initialized")
+        return camera_system.file_manager.trash
+
+    register_photo_trash_routes(
+        app, get_trash_store, _operation_lock,
+        lambda: camera_system.eink_display.is_busy() or camera_system.file_manager.pending_saves.busy(),
+        lambda: camera_system.update_activity(),
+    )
     @app.post("/api/capture")
     def api_capture():
         global camera_system
@@ -1634,6 +1652,8 @@ def _create_fastapi_routes():
         if camera_system is None:
             raise HTTPException(status_code=503, detail="Camera system not initialized")
         with _operation_lock:
+            if camera_system.eink_display.is_busy() or camera_system.file_manager.pending_saves.busy():
+                raise HTTPException(409, "Camera is saving or refreshing; wait before deleting.")
             return camera_system.delete_photo_api(photo_id)
 
     @app.post("/api/settings/reload")

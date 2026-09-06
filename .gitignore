@@ -1,6 +1,7 @@
 # Photos (created at runtime)
 photos/
 dithered_photos/
+.photo-trash/
 photos-test/
 dithered_photos-test/
 .runtime/
