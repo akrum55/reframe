@@ -27,18 +27,28 @@ git show 8b82d05
 
 ## Remote layout
 
-On the Mac, `upstream` points to the original project with pushing disabled.
-When publication is approved, `origin` points to the personal GitHub repository.
+Public custom fork: [akrum55/reframe](https://github.com/akrum55/reframe), with
+`austin-camera` as its default branch. On the Mac, `upstream` points to the
+original project with pushing disabled; `origin` points to this personal fork.
 Keep credentials in the normal GitHub authentication mechanism, never in remote
 URLs, commits, config examples, or notes. Git author email uses GitHub noreply.
 
-The camera does not need GitHub credentials: receive a reviewed Git bundle over
-the authenticated SSH connection, verify it, import its release ref, then activate
-the release while camera/dashboard services are stopped and the hardware is idle.
-Its public `origin` can continue to provide stock update checks. A custom branch
-will be reported as diverged; do not use the stock Install Update button to replace
-it with stock code. Future custom deployments are explicitly reviewed SSH actions,
-not unattended updates.
+The camera does not need GitHub credentials because this fork is public. Initial
+deployment receives a reviewed Git bundle over authenticated SSH. Verify/import
+the release, then activate it while camera/dashboard services are stopped and
+the hardware is idle.
+
+After bootstrap, configure its `origin` to the personal fork and track
+`origin/austin-camera`; keep the original repository as `upstream`. Only configure
+this after verifying the published ref and deployed revision. The stock dashboard
+updater can then fast-forward to our reviewed custom releases rather than replace
+them with stock code. Until that tracking is configured, it may report divergence
+from stock upstream. Never discard changes to unlock installation.
+
+Keep pushing rights/credentials on the Mac only. Prefer guided SSH deployment
+with backups and acceptance tests even when the stock update button is available:
+it runs the dependency/service helper and is broader than a source-only patch.
+There are no unattended merges, installations, or update monitors.
 
 ## Bringing in upstream updates
 
