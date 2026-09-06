@@ -1,5 +1,13 @@
 # reFrame – the ePaper camera
 
+> **Custom camera release:** This branch preserves the original reFrame history
+> and adds a triple-short-press dashboard QR shortcut. Stock upstream remains on
+> `main`; the feature is isolated on `feature/triple-press-qr`; reviewed releases
+> use `austin-camera`. See [custom controls](docs/triple-press-qr.md) and
+> [version/update/removal workflow](docs/customization-workflow.md).
+> The original project and documentation follow below; this is not an official
+> upstream release. No gallery redesign or offline gallery is included.
+
 <img src="docs/images/reframe-hero.jpg" alt="reFrame ePaper camera in hand" width="720" />
 
 reFrame is an experimental digital camera designed to capture and display one photo at a time.
