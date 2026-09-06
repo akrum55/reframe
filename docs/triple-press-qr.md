@@ -14,6 +14,7 @@ Initial implementation base: `5b88b443a9225b7954b57bbb784854c081c6991b`.
 | Hold for at least two seconds | Cancel taps; retain existing PiSugar shutdown |
 | Extra rapid taps after QR | Ignored until a continuous 0.5-second release |
 | Input during capture, display refresh, or a hardware API operation | Discarded, not queued |
+| Button communication error | Discard the interrupted burst until 0.5 seconds of continuous release |
 
 Automatic QR on Wi-Fi connection/reconnection defaults to off. Existing saved
 settings must explicitly be migrated to off; defaults do not override saved true.
@@ -33,8 +34,11 @@ camera capture/processing algorithm is changed by the feature.
 - `dashboard.py` and `settings.example.json`: matching QR defaults/help only.
 - `tests/test_button_*.py` and `tests/test_qr_settings.py`: regression coverage.
 
-Startup-held input, failed I2C reads, and busy periods require a stable release
-before recognizing another gesture. Worker teardown waits for that worker only;
+Startup-held input and busy periods require a stable release before recognizing
+another gesture. Failed I2C reads additionally require 0.5 seconds of continuous
+release, so a trailing tap in an interrupted triple cannot become a photo.
+This prevents a spurious capture; it does not repair unreliable communication or
+reconstruct taps that the hardware did not report. Worker teardown waits for that worker only;
 upstream background photo-save/display threads are separate. This feature is not
 a replacement for complete graceful shutdown. Stop services only when idle.
 
@@ -53,8 +57,10 @@ FastAPI, and HTTPX:
 .venv/bin/python -B -m unittest discover -s tests -q
 ```
 
-47 tests passed during local preparation/review. Source presence and automated
-tests are not proof of installation or a physical hardware pass.
+The initial release passed 47 tests. Four additional fault-recovery regressions
+cover interrupted triple taps, repeated faults, busy resets, and the exact quiet
+deadline. Source presence and automated tests are not proof of installation or a
+physical hardware pass.
 
 ## Deployment and rollback
 

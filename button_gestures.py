@@ -14,6 +14,7 @@ class ButtonGestureRecognizer:
     use None for a failed read. It returns "capture", "qr", or None. A tap must
     have debounced press and release edges. Two taps expire without an action.
     Holds of at least two seconds cancel pending taps; PiSugar retains shutdown.
+    A failed read discards the whole burst until 500 ms of continuous release.
 
     Timing uses the first observed edge once that edge survives debounce. A next
     press observed exactly 500 ms after release belongs to the same sequence.
@@ -34,7 +35,7 @@ class ButtonGestureRecognizer:
         """Discard pending input and require a newly observed stable release.
 
         Call while another operation owns the camera/display to drop busy-time
-        presses. An active QR quiet-period guard survives reset: its 500 ms clock
+        presses. An active QR/fault quiet-period guard survives reset: its 500 ms clock
         restarts with the next released reading. Thus a quickly failing QR action
         followed by a fourth tap cannot turn that tap into an accidental photo.
         """
@@ -56,6 +57,9 @@ class ButtonGestureRecognizer:
         """Consume one reading; ``now`` must be a monotonic time in seconds."""
         if pressed is None:
             # An I2C fault is unknown input, never an invented button release.
+            # Discard trailing taps from the interrupted burst too: otherwise
+            # the third tap could be mistaken for a new single-photo command.
+            self._suppressing = True
             self.reset()
             return None
 

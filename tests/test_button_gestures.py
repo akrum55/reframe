@@ -165,6 +165,49 @@ class ButtonGestureTests(unittest.TestCase):
         self.sample(False, 1.0)
         self.assertEqual(self.actions, [])
 
+    def test_fault_in_triple_does_not_turn_final_tap_into_photo(self):
+        self.tap(0.1, 0.2)
+        self.tap(0.3, 0.4)
+        self.sample(None, 0.45)
+        self.edge(False, 0.46)
+        self.tap(0.55, 0.65)
+        self.sample(False, 1.2)
+        self.assertEqual(self.actions, [])
+        self.tap(1.3, 1.4)
+        self.sample(False, 1.9)
+        self.assertEqual(self.actions, ["capture"])
+
+    def test_fault_quiet_deadline_allows_fresh_press_without_extra_poll(self):
+        self.sample(None, 0.1)
+        self.edge(False, 0.125)
+        self.tap(0.625, 0.75)
+        self.sample(False, 1.25)
+        self.assertEqual(self.actions, ["capture"])
+
+    def test_repeated_fault_restarts_released_quiet_period(self):
+        self.sample(None, 0.1)
+        self.edge(False, 0.2)
+        self.sample(None, 0.6)
+        self.edge(False, 0.61)
+        self.tap(0.9, 1.0)
+        self.sample(False, 1.5)
+        self.assertEqual(self.actions, [])
+        self.tap(1.6, 1.7)
+        self.sample(False, 2.2)
+        self.assertEqual(self.actions, ["capture"])
+
+    def test_busy_reset_preserves_fault_quiet_guard(self):
+        self.sample(None, 0.2)
+        self.edge(False, 0.3)
+        self.button.reset()
+        self.edge(False, 0.4)
+        self.tap(0.5, 0.6)
+        self.sample(False, 1.1)
+        self.assertEqual(self.actions, [])
+        self.tap(1.2, 1.3)
+        self.sample(False, 1.8)
+        self.assertEqual(self.actions, ["capture"])
+
     def test_reset_during_press_discards_later_release(self):
         self.edge(True, 0.1)
         self.button.reset()
