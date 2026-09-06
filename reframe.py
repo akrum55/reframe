@@ -63,6 +63,7 @@ import time
 from button_gestures import ButtonGestureRecognizer
 from button_actions import ButtonActionDispatcher
 from photo_trash import PhotoTrash, PendingPhotoSaves, validate_ids
+from button_input import read_button_state
 
 # ═══════════════════════════════════════════════════════════════════
 # HARDWARE: Display — defaults to Waveshare 4" ePaper Spectra 6
@@ -1822,14 +1823,10 @@ def main():
     bus = smbus2.SMBus(1)
 
     def is_power_button_pressed():
-        try:
-            reg_val = bus.read_byte_data(I2C_ADDRESS, BUTTON_REGISTER)
-            return bool(reg_val & 0x01)  # Check the least significant bit
-        except Exception as e:
-            logging.error("Failed to read I2C: %s", e)
-            # A failed read is not a release. Cancel the gesture and require
-            # a clean released state before accepting a new press.
-            return None
+        # Short, bounded retries can recover a transient NACK at a press edge.
+        # Exhausted/unknown failures still cancel the gesture; no state is guessed.
+        return read_button_state(
+            lambda: bus.read_byte_data(I2C_ADDRESS, BUTTON_REGISTER))
 
     button_gestures = ButtonGestureRecognizer()
     button_actions = ButtonActionDispatcher(
