@@ -6,9 +6,9 @@
 > use `austin-camera`. See [custom controls](docs/triple-press-qr.md) and
 > [version/update/removal workflow](docs/customization-workflow.md).
 > The original project and documentation follow below; this is not an official
-> upstream release. This optional feature branch also adds
-> [multi-select photo Trash and restore](docs/photo-trash.md), currently for
-> local preview. No offline gallery or cloud photo storage is included.
+> upstream release. The custom release also includes
+> [multi-select photo Trash and restore](docs/photo-trash.md), developed separately
+> on `feature/photo-trash`. No offline gallery or cloud photo storage is included.
 
 <img src="docs/images/reframe-hero.jpg" alt="reFrame ePaper camera in hand" width="720" />
 

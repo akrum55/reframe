@@ -9,13 +9,14 @@ Original authorship/history and Apache-2.0 license are preserved.
 | --- | --- |
 | `main` | Untouched stock reFrame; tracks `upstream/main` on the Mac |
 | `feature/triple-press-qr` | Isolated QR implementation and regression tests |
-| `feature/photo-trash` | Optional multi-select/Trash/restore feature; local preview until accepted |
+| `feature/photo-trash` | Isolated multi-select/Trash/restore implementation and regression tests |
 | `austin-camera` | Reviewed combined release deployed to the camera |
 
 Initial stock base: `5b88b443a9225b7954b57bbb784854c081c6991b`.
 
 - `514d69c`: retain the executable installer permission already present on the camera; no installer content changes.
 - `8b82d05`: triple-short-press QR feature, QR defaults/help, and tests.
+- `827754f`: recoverable multi-select photo Trash/restore, accepted and deployed after private backup and native tests.
 - Release documentation is a separate commit; it does not change camera behavior.
 
 Read-only comparisons:
@@ -85,9 +86,8 @@ source document, identifies device-specific backup locations and acceptance.
 
 Only software, tests, and technical documentation belong here. Live settings,
 credentials, personal photos, recovery archives, and project/vault notes do not.
-The deployed customization is triple-short-press QR with deferred single capture.
-See [QR details](triple-press-qr.md). This feature branch additionally contains
-[multi-select photo Trash and restore](photo-trash.md); it must be reviewed and
-deployed before it appears on the camera. Preserve `.photo-trash/` with private
+The deployed customizations are triple-short-press QR with deferred single capture
+and [multi-select photo Trash and restore](photo-trash.md).
+See [QR details](triple-press-qr.md). Preserve `.photo-trash/` with private
 photo backups, never in public source or Git, and restore wanted photos before
 removing the feature.

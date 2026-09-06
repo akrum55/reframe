@@ -1,8 +1,14 @@
 # Select photos → Move to Trash
 
-Austin's optional dashboard feature, isolated on `feature/photo-trash` from the
-verified `austin-camera` release `7122fde`. Local preview only until reviewed
-and deployed; no upstream update or camera-control behavior is changed.
+Austin's optional dashboard feature, developed on `feature/photo-trash` from the
+verified `austin-camera` release `7122fde`, then accepted and deployed as `827754f`
+on September 6, 2026. No upstream update or camera-control behavior is changed.
+
+Deployment verification passed: 80 tests on the camera's Python 3.13.5, seven
+JavaScript tests locally, private backup verification, and a live dashboard API
+round-trip with two synthetic photo pairs restored byte-for-byte. No personal
+photo was used for the mutation test. Physical controls were not retested by
+this deployment; their code and saved settings were preserved.
 
 ## Use
 
