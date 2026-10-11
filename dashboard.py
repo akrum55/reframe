@@ -8,6 +8,8 @@ import asyncio
 import time
 import shutil
 import math
+import re
+import ipaddress
 import tempfile
 import threading
 from io import BytesIO
@@ -15,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Response
 from starlette.background import BackgroundTask
 import httpx
 from PIL import Image
@@ -31,11 +33,148 @@ SETTINGS_PATH = os.path.join(BASE_PATH, "settings.json")
 USER_DATA_PATHS = ["settings.json", "photos", "dithered_photos", ".photo-trash"]
 UPDATE_HELPER_PATH = "/usr/local/sbin/reframe-apply-update"
 UPDATE_PENDING_PATH = os.path.join(BASE_PATH, ".runtime", "update_pending")
+DIAGNOSTICS_PATH = os.path.join(BASE_PATH, ".runtime", "diagnostics.json")
+REFRAME_LOG_PATH = os.path.join(BASE_PATH, ".runtime", "reframe.log")
 
 os.makedirs(PHOTOS_PATH, exist_ok=True)
 os.makedirs(DITHERED_PHOTOS_PATH, exist_ok=True)
 
 app = FastAPI(title="Reframe Dashboard", description="Control & Gallery Interface for Reframe Camera")
+
+
+def load_diagnostics() -> Dict[str, Any]:
+    """Read the last diagnostic snapshot when the camera service is down."""
+    try:
+        with open(DIAGNOSTICS_PATH, "r", encoding="utf-8") as diagnostic_file:
+            record = json.load(diagnostic_file)
+        return record if isinstance(record, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def tail_reframe_log(max_lines=100) -> str:
+    """Read a bounded tail without loading entire rotating log files."""
+    lines = []
+    for path in (f"{REFRAME_LOG_PATH}.1", REFRAME_LOG_PATH):
+        try:
+            with open(path, "rb") as log_file:
+                size = log_file.seek(0, os.SEEK_END)
+                log_file.seek(max(0, size - 65536))
+                if size > 65536:
+                    log_file.readline()  # Skip a partial first line.
+                lines.extend(log_file.read(65536).decode("utf-8", errors="replace").splitlines(keepends=True))
+        except OSError:
+            continue
+    return "".join(lines[-max_lines:])
+
+
+def redact_diagnostic_log(content: str, settings: Dict[str, Any]) -> str:
+    """Keep useful local diagnostics without sharing known secrets or network details."""
+    private_key = re.compile(
+        r"password|passwd|passphrase|psk|authorization|token|api[_ -]?key|secret",
+        re.IGNORECASE,
+    )
+
+    def secrets(record):
+        if isinstance(record, dict):
+            for key, value in record.items():
+                if private_key.search(str(key)) and isinstance(value, str) and value:
+                    yield value
+                else:
+                    yield from secrets(value)
+        elif isinstance(record, list):
+            for value in record:
+                yield from secrets(value)
+
+    for secret in sorted(set(secrets(settings)), key=len, reverse=True):
+        content = content.replace(secret, "[redacted]")
+
+    result = []
+    for line in content.splitlines(keepends=True):
+        if private_key.search(line) or re.search(r"\b(?:ssid|bssid|wi-?fi)\b", line, re.IGNORECASE):
+            result.append("[private diagnostic details omitted]\n")
+            continue
+        line = re.sub(r"https?://[^\s<>\"']+", "[url]", line, flags=re.IGNORECASE)
+        line = re.sub(r"(?<!\w)/(?:[^\s\"'<>])+", "[path]", line)
+        line = re.sub(r"(?<!\w)(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?!\w)", "[address]", line)
+        # IPv4 and IPv6 tokens are scrubbed, but timestamps and ordinary words remain.
+        for token in set(re.findall(r"[0-9A-Fa-f:.]+(?:%[\w]+)?", line)):
+            candidate = token.rstrip(".,")
+            if "." not in candidate and ":" not in candidate:
+                continue
+            try:
+                ipaddress.ip_address(candidate)
+            except ValueError:
+                try:
+                    candidate = candidate.rstrip(":")
+                    ipaddress.ip_address(candidate)
+                except ValueError:
+                    continue
+            line = line.replace(candidate, "[address]")
+        result.append(line)
+    return "".join(result)
+
+
+def build_health_report(
+    hardware_status: Optional[Dict[str, Any]],
+    stored_diagnostics: Dict[str, Any],
+    storage: Dict[str, int],
+    battery: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Build the small status model used by the home screen and Health panel."""
+    live = isinstance(hardware_status, dict) and hardware_status.get("success") is True
+    diagnostics = hardware_status.get("diagnostics", {}) if live else stored_diagnostics
+    issues = diagnostics.get("issues", {}) if isinstance(diagnostics, dict) else {}
+    if not isinstance(issues, dict):
+        issues = {}
+    messages = {}
+    for component, issue in issues.items():
+        message = issue.get("message") if isinstance(issue, dict) else issue
+        if isinstance(message, str) and message:
+            messages[component] = message
+
+    total_bytes = max(int(storage.get("total", 0)), 1)
+    free_bytes = max(int(storage.get("free", 0)), 0)
+    free_gb = free_bytes / (1024 ** 3)
+    used_percent = ((total_bytes - free_bytes) / total_bytes) * 100
+    if free_bytes < 500 * 1024 * 1024:
+        messages.setdefault("storage", f"Only {free_gb:.1f} GB free; photos may not save")
+
+    battery_level = battery.get("battery_level")
+    if battery_level is not None:
+        battery_level = int(battery_level)
+        if battery_level <= 5:
+            messages["battery"] = f"Battery critically low ({battery_level}%)"
+
+    order = ("camera", "button", "display", "storage", "service", "battery")
+    primary = next((
+        component for component in order
+        if component in messages or (component == "service" and not live)
+    ), None)
+    headlines = {
+        "camera": "camera problem",
+        "button": "button not responding",
+        "display": "display problem",
+        "storage": "storage full",
+        "service": "camera service unavailable",
+        "battery": "battery critically low",
+    }
+    headline = headlines.get(primary, "system issue")
+    if primary == "camera" and "not detected" in messages["camera"].lower():
+        headline = "camera not detected"
+    last_activity = diagnostics.get("last_activity") if isinstance(diagnostics, dict) else None
+    if isinstance(last_activity, dict):
+        last_activity = last_activity.get("message")
+
+    return {
+        "system_online": primary is None,
+        "headline": "system online" if primary is None else headline,
+        "service": {"ok": live, "message": "Running" if live else "Not responding"},
+        "issues": [messages[key] for key in order if key in messages],
+        "storage": f"{free_gb:.1f} GB free ({used_percent:.0f}% used)",
+        "battery": battery_level,
+        "last_activity": last_activity,
+    }
 
 
 def prepare_dithered_export(image_path: str, upscale_2x: bool) -> tuple[bytes, str, str]:
@@ -117,6 +256,7 @@ def validate_settings(settings: Dict[str, Any]) -> None:
     display = section(settings, "display", "display")
     boolean(display.get("auto_display"), "display.auto_display")
     number(display.get("display_timeout"), "display.display_timeout", 0, 3600)
+    boolean(display.get("fast_refresh", False), "display.fast_refresh")
 
     system = section(settings, "system", "system")
     integer(system.get("auto_refresh_interval"), "system.auto_refresh_interval", 5, 300)
@@ -156,7 +296,8 @@ class SettingsManager:
             },
             "display": {
                 "auto_display": True,
-                "display_timeout": 0
+                "display_timeout": 0,
+                "fast_refresh": True  # Austin: fast mode is the chosen default.
             },
             "system": {
                 "auto_refresh_interval": 30,
@@ -1234,6 +1375,10 @@ async def dashboard():
                 height: 12px;
                 background: var(--secondary-color);
             }
+
+            .status-indicator.issue {
+                background: #d32f2f;
+            }
             
             .settings-modal {
                 display: none;
@@ -1302,6 +1447,7 @@ async def dashboard():
                 display: grid;
                 grid-template-columns: repeat(2, minmax(0, 1fr));
                 grid-template-areas:
+                    "health health"
                     "camera processing"
                     "system processing"
                     "system extensions"
@@ -1318,6 +1464,10 @@ async def dashboard():
 
             .settings-camera {
                 grid-area: camera;
+            }
+
+            .settings-health {
+                grid-area: health;
             }
 
             .settings-processing {
@@ -1347,7 +1497,35 @@ async def dashboard():
                 border-bottom: 1px solid var(--secondary-color);
                 padding-bottom: 10px;
             }
-            
+
+            .health-row {
+                display: grid;
+                grid-template-columns: minmax(120px, 0.35fr) 1fr;
+                gap: 14px;
+                padding: 10px 0;
+                border-top: 1px dotted var(--panel-border-color);
+            }
+
+            .health-row:first-of-type {
+                border-top: none;
+            }
+
+            .health-row strong {
+                font-weight: bold;
+                font-size: 0.9rem;
+                color: #666;
+            }
+
+            .health-row .issue {
+                color: #d32f2f;
+            }
+
+            .health-actions {
+                display: flex;
+                gap: 8px;
+                margin-top: 14px;
+            }
+
             .setting-group {
                 margin-bottom: 20px;
                 display: flex;
@@ -1535,6 +1713,7 @@ async def dashboard():
                 .settings-grid {
                     grid-template-columns: 1fr;
                     grid-template-areas:
+                        "health"
                         "camera"
                         "processing"
                         "system"
@@ -1591,8 +1770,8 @@ async def dashboard():
                 <div class="status-bar">
                 <h1>reframe.camera dashboard</h1>
                 <div class="status-item">
-                    <div class="status-indicator"></div>
-                    <span>system online</span>
+                    <div class="status-indicator" id="system-status-indicator"></div>
+                    <span id="system-status-text">system online</span>
                 </div>
                 <div class="status-item">
                     <span id="battery-level">battery: --%</span>
@@ -1646,6 +1825,35 @@ async def dashboard():
                 </div>
                 
                 <div class="settings-grid">
+                <div class="settings-section settings-health" id="health-section">
+                    <h3>health</h3>
+                    <div class="health-row">
+                        <strong>camera service</strong>
+                        <span id="health-service">checking...</span>
+                    </div>
+                    <div class="health-row">
+                        <strong>current issues</strong>
+                        <span id="health-issues">none</span>
+                    </div>
+                    <div class="health-row">
+                        <strong>storage</strong>
+                        <span id="health-storage">checking...</span>
+                    </div>
+                    <div class="health-row">
+                        <strong>battery</strong>
+                        <span id="health-battery">checking...</span>
+                    </div>
+                    <div class="health-row">
+                        <strong>last activity</strong>
+                        <span id="health-last-activity">none recorded</span>
+                    </div>
+                    <div class="health-actions">
+                        <form action="/api/diagnostics/logs" method="get" target="_blank">
+                            <button class="button" type="submit">show logs</button>
+                        </form>
+                    </div>
+                </div>
+
                 <div class="settings-section settings-camera">
                     <h3>camera settings</h3>
                     <div class="setting-group disabled-setting">
@@ -1784,7 +1992,17 @@ async def dashboard():
                 </div>
 
                 <div class="settings-section settings-exports">
-                    <h3>advanced exports</h3>
+                    <h3>advanced</h3>
+                    <div class="setting-group">
+                        <div>
+                            <label class="setting-label" for="fast-refresh">screen refresh</label>
+                            <select id="fast-refresh" class="setting-input">
+                                <option value="false">standard (~21 seconds)</option>
+                                <option value="true">fast (~11 seconds, experimental)</option>
+                            </select>
+                        </div>
+                        <div class="setting-help">Fast mode uses an undocumented setting to drive the ePaper display twice as fast. Long-term effects on the display are untested.</div>
+                    </div>
                     <div class="setting-group">
                         <div>
                             <span class="setting-label">2× dithered downloads and uploads</span>
@@ -1891,7 +2109,48 @@ async def dashboard():
                     console.log('Could not notify user activity:', error);
                 }
             }
-            
+
+            async function updateHealth() {
+                const indicator = document.getElementById('system-status-indicator');
+                const statusText = document.getElementById('system-status-text');
+                try {
+                    const response = await fetch('/api/health', { cache: 'no-store' });
+                    if (!response.ok) throw new Error(`Health API returned ${response.status}`);
+                    const data = await response.json();
+
+                    indicator.classList.toggle('issue', !data.system_online);
+                    statusText.textContent = data.headline || 'system online';
+
+                    const service = document.getElementById('health-service');
+                    service.textContent = data.service.message;
+                    service.classList.toggle('issue', !data.service.ok);
+
+                    const issues = document.getElementById('health-issues');
+                    issues.textContent = data.issues.length ? data.issues.join(' • ') : 'none';
+                    issues.classList.toggle('issue', data.issues.length > 0);
+
+                    document.getElementById('health-storage').textContent = data.storage;
+                    document.getElementById('health-battery').textContent =
+                        data.battery === null ? 'Unavailable' : `${data.battery}%`;
+
+                    document.getElementById('health-last-activity').textContent =
+                        data.last_activity || 'none recorded';
+
+                    const batteryElement = document.getElementById('battery-level');
+                    if (data.battery !== null) {
+                        batteryElement.textContent = `battery: ${data.battery}%`;
+                        batteryElement.style.color = data.battery <= 10 ? '#d32f2f' : '';
+                    } else {
+                        batteryElement.textContent = 'battery: --%';
+                        batteryElement.style.color = '#666';
+                    }
+                } catch (error) {
+                    console.error('Error checking system health:', error);
+                    indicator.classList.add('issue');
+                    statusText.textContent = 'health check unavailable';
+                }
+            }
+
             async function loadPhotos(page = currentPage) {
                 if (photoLibrary.trashView) return photoLibrary.loadTrash();
                 const requestedPage = Math.max(1, parseInt(page, 10) || 1);
@@ -2311,6 +2570,7 @@ async def dashboard():
                     console.error('Error capturing photo:', error);
                     alert('Error capturing photo');
                 } finally {
+                    updateHealth();
                     // Restore button state
                     const captureBtn = document.querySelector('button[onclick="capturePhoto()"]');
                     if (captureBtn) {
@@ -2350,6 +2610,7 @@ async def dashboard():
                     const response = await fetch('/api/settings');
                     const settings = await response.json();
                     populateSettingsForm(settings);
+                    updateHealth();
                     document.getElementById('settings-modal').style.display = 'block';
                     lockSettingsPageScroll();
                 } catch (error) {
@@ -2426,6 +2687,7 @@ async def dashboard():
                 toggleOrderedSettings();
                 
                 // System settings
+                document.getElementById('fast-refresh').value = settings.display?.fast_refresh === true ? 'true' : 'false';
                 document.getElementById('camera-name').value = settings.system.camera_name || '';
                 document.getElementById('auto-refresh-interval').value = settings.system.auto_refresh_interval;
                 document.getElementById('auto-timeout-enabled').value = settings.system.auto_timeout_enabled ? 'true' : 'false';
@@ -2552,6 +2814,9 @@ async def dashboard():
                             bayer_size: parseInt(document.getElementById('bayer-size').value),
                             threshold_scale: parseFloat(document.getElementById('threshold-scale').value)
                         },
+                        display: {
+                            fast_refresh: document.getElementById('fast-refresh').value === 'true'
+                        },
                         system: {
                             camera_name: document.getElementById('camera-name').value.trim(),
                             auto_refresh_interval: parseInt(document.getElementById('auto-refresh-interval').value),
@@ -2614,6 +2879,9 @@ async def dashboard():
                                 dithering_method: "floyd_steinberg",
                                 bayer_size: 4,
                                 threshold_scale: 1.0
+                            },
+                            display: {
+                                fast_refresh: true
                             },
                             system: {
                                 camera_name: "",
@@ -3134,14 +3402,14 @@ async def dashboard():
             document.addEventListener('DOMContentLoaded', function() {
                 loadPhotos(currentPage);
                 updateAutoRefreshInterval();
-                updateBatteryLevel();
+                updateHealth();
                 updateStorageInfo();
                 
                 // Add event listener for dithering method changes
                 document.getElementById('dithering-method').addEventListener('change', toggleOrderedSettings);
                 
-                // Update battery level every 30 seconds
-                setInterval(updateBatteryLevel, 30000);
+                // Health includes battery; keep the custom storage readout too.
+                setInterval(updateHealth, 30000);
                 setInterval(updateStorageInfo, 30000);
             });
 
@@ -3163,38 +3431,6 @@ async def dashboard():
                     event.returnValue = '';
                 }
             });
-            
-            async function updateBatteryLevel() {
-                try {
-                    const response = await fetch('/api/battery');
-                    if (response.ok) {
-                        const data = await response.json();
-                        const batteryElement = document.getElementById('battery-level');
-                        
-                        if (data.battery_level !== null && data.battery_level !== undefined) {
-                            batteryElement.textContent = `battery: ${data.battery_level}%`;
-                            
-                            // Add visual indicator based on battery level
-                            batteryElement.className = '';
-                            if (data.battery_level <= 10) {
-                                batteryElement.style.color = '#d32f2f'; // Red for low battery
-                            } else if (data.battery_level <= 25) {
-                                batteryElement.style.color = '#f57c00'; // Orange for warning
-                            } else {
-                                batteryElement.style.color = ''; // Default color
-                            }
-                        } else {
-                            batteryElement.textContent = 'battery: --%';
-                            batteryElement.style.color = '#666'; // Gray for unknown
-                        }
-                    }
-                } catch (error) {
-                    console.log('Could not fetch battery level:', error);
-                    const batteryElement = document.getElementById('battery-level');
-                    batteryElement.textContent = 'battery: --%';
-                    batteryElement.style.color = '#666';
-                }
-            }
             
             // Close modal when clicking outside of it
             window.onclick = function(event) {
@@ -3536,6 +3772,47 @@ async def get_system_status():
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Hardware service unavailable: {str(e)}")
 
+
+@app.get("/api/health")
+async def get_health():
+    """Return useful diagnostics even when the camera service is unavailable."""
+    battery_task = asyncio.create_task(asyncio.to_thread(read_battery_level))
+    hardware_status = None
+    try:
+        hardware_status = await asyncio.wait_for(
+            reframe_client.get("/status"),
+            timeout=3,
+        )
+    except Exception:
+        pass
+
+    disk = shutil.disk_usage(PHOTOS_PATH)
+    storage = {
+        "total": disk.total,
+        "used": disk.used,
+        "free": disk.free,
+    }
+    battery = await battery_task
+    return build_health_report(
+        hardware_status,
+        load_diagnostics(),
+        storage,
+        battery,
+    )
+
+
+@app.get("/api/diagnostics/logs", response_class=PlainTextResponse)
+async def get_diagnostic_logs():
+    """Load camera logs only when the user opens them in Settings."""
+    content = await asyncio.to_thread(tail_reframe_log)
+    if content:
+        content = redact_diagnostic_log(content, settings_manager.load_settings())
+    return PlainTextResponse(
+        content or "No camera logs recorded yet.",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════
 # HARDWARE: Battery — PiSugar 3 via pisugar-server TCP
 # Battery level is read by sending "get battery" to pisugar-server
@@ -3543,19 +3820,17 @@ async def get_system_status():
 # To use a different battery monitor, replace this endpoint.
 # See: https://github.com/PiSugar/PiSugar/wiki/PiSugar-Power-Manager-(Software)
 # ═══════════════════════════════════════════════════════════════════
-@app.get("/api/battery")
-async def get_battery_level():
-    """Get battery level from PiSugar."""
+def read_battery_level():
+    """Read the PiSugar battery without blocking the dashboard event loop."""
     import subprocess
-    
+
     try:
-        # Use TCP method (working reliably)
         result = subprocess.run(
-            ['nc', '-q', '0', '127.0.0.1', '8423'],
+            ['nc', '-w', '2', '-q', '0', '127.0.0.1', '8423'],
             input='get battery\n',
             capture_output=True,
             text=True,
-            timeout=5
+            timeout=3
         )
         if result.returncode == 0:
             response = result.stdout.strip()
@@ -3564,12 +3839,17 @@ async def get_battery_level():
                 battery_str = response.split(':')[1].strip()
                 battery_level = int(float(battery_str))  # Convert decimal to int
                 return {"battery_level": battery_level, "source": "tcp"}
-        
-        # If TCP fails, return unknown
+
         return {"battery_level": None, "source": "unknown", "error": "Could not connect to PiSugar"}
-        
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get battery level: {str(e)}")
+        return {"battery_level": None, "source": "unknown", "error": str(e)}
+
+
+@app.get("/api/battery")
+async def get_battery_level():
+    """Get battery level from PiSugar."""
+    return await asyncio.to_thread(read_battery_level)
 
 @app.post("/api/timeout/reset")
 async def reset_timeout():

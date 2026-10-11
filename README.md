@@ -9,6 +9,10 @@
 > upstream release. The custom release also includes
 > [multi-select photo Trash and restore](docs/photo-trash.md), developed separately
 > on `feature/photo-trash`. No offline gallery or cloud photo storage is included.
+> This release integrates upstream fast mode and diagnostics (`e86aebc`). At the
+> owner's explicit opt-in, **experimental fast refresh is the custom default**;
+> Settings → Advanced → Screen Refresh can restore standard speed. Upstream has
+> not established long-term panel wear or color accuracy for fast timing.
 
 <img src="docs/images/reframe-hero.jpg" alt="reFrame ePaper camera in hand" width="720" />
 

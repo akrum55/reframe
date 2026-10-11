@@ -54,6 +54,14 @@ There are no unattended merges, installations, or update monitors.
 
 ## Bringing in upstream updates
 
+A fork is a separately maintained repository, not a frozen export and not an
+automatic subscription. The camera checks `origin/austin-camera` for reviewed
+releases. It never merges original `upstream/main` on the device. Keep custom
+behavior in small modules (`button_*`, `photo_trash*`, and `static/photo-library.*`)
+with narrow integration hooks; upstream changes to those hooks still need review.
+The upload-extension API is not a general plug-in API for controls or dashboard
+features, so compatibility cannot be guaranteed by simply dropping in a plug-in.
+
 1. Start with a clean Mac checkout and keep an identified, recoverable deployed release.
 2. Fetch `upstream`, review changes since the recorded base, and fast-forward local
    `main` only if it remains stock. Never add personal commits to `main`.
@@ -69,6 +77,32 @@ There are no unattended merges, installations, or update monitors.
 The stock updater refreshes dependencies/services as well as code; a source-only
 rollback cannot reliably undo an arbitrary full update. Do not assume its built-in
 settings backup covers photos, custom code, or the operating system.
+
+### October 2026 upstream integration
+
+Upstream `e86aebc9c46b7277ba827164462a43f705f82ca4` adds optional experimental
+fast display timing, persistent diagnostics, and a dashboard health panel. It
+does not change dependencies or require a Raspberry Pi OS reflash. Deploy its
+updated dashboard service unit as well as source: the dashboard no longer waits
+for successful camera startup, allowing it to report startup failures.
+
+This fork retains the 0.5-second triple-tap QR controls, read retries with unknown
+state cancellation, automatic Wi-Fi QR off, recoverable Trash/restore, confirmed
+Empty Trash, temporary Undo notice, and SD-space readout. The button health
+adapter reports faults without turning a failed read into a false release.
+
+The owner explicitly opted into **fast refresh as the default** after reviewing
+the upstream warning. New/default settings use `display.fast_refresh=true`;
+explicit saved `false` remains standard speed. Unreadable or malformed settings
+fail safe to standard timing. Deployment changes only this one saved setting.
+The experimental undocumented clock has unverified long-term panel wear/color
+accuracy; faster waveform completion is not evidence that minimum refresh spacing
+can be reduced. Standard speed remains available in Settings → Advanced.
+
+Diagnostic log downloads are bounded, non-cacheable, and redacted for known
+secrets and common network/path identifiers; they are still private support data,
+not a guarantee that arbitrary exception text is safe to publish. Keep the
+dashboard on trusted networks.
 
 ## Removing this feature
 
