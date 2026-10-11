@@ -66,6 +66,7 @@ from button_actions import ButtonActionDispatcher
 from photo_trash import PhotoTrash, PendingPhotoSaves, validate_ids
 from button_input import read_button_state
 from button_health import ButtonHealthMonitor
+from button_trace import load_trace
 
 # ═══════════════════════════════════════════════════════════════════
 # HARDWARE: Display — defaults to Waveshare 4" ePaper Spectra 6
@@ -1972,25 +1973,45 @@ def main():
     logging.info("Button: single tap + 0.5s pause = photo; triple tap = dashboard QR; double tap = no action")
     logging.info("Holds >=2s remain reserved for PiSugar shutdown; busy presses are discarded")
 
+    # One-shot, private diagnostics; absent arm file means no trace is started.
+    # The recorder only observes existing readings and writes off the polling thread.
+    button_trace = load_trace(RUNTIME_PATH)
     try:
         while True:
+            if button_trace is not None:
+                read_started = time.monotonic()
             current_state = is_power_button_pressed()
+            if button_trace is not None:
+                read_seconds = time.monotonic() - read_started
 
             # Never block I2C sampling on a capture or the long e-paper
             # refresh. Discard partial gestures while hardware/API work runs.
-            if button_actions.is_busy():
+            busy = button_actions.is_busy()
+            now = time.monotonic()
+            action = None
+            submitted = None
+            if busy:
                 button_gestures.reset()
-                button_gestures.update(current_state, time.monotonic())
+                button_gestures.update(current_state, now)
             else:
-                action = button_gestures.update(current_state, time.monotonic())
-                if action and not button_actions.submit(action):
-                    logging.info("Button action discarded because hardware is busy: %s", action)
-                    update_diagnostics(activity="Button action ignored while camera was busy")
-                    button_gestures.reset()
+                action = button_gestures.update(current_state, now)
+                if action:
+                    submitted = button_actions.submit(action)
+                    if not submitted:
+                        logging.info("Button action discarded because hardware is busy: %s", action)
+                        update_diagnostics(activity="Button action ignored while camera was busy")
+                        button_gestures.reset()
+            if button_trace is not None:
+                button_trace.observe(raw=current_state, now=now, read_seconds=read_seconds,
+                                     busy=busy, gesture=button_gestures, emitted=action)
+                if action:
+                    button_trace.action(now=now, emitted=action, submitted=submitted)
             sleep(BUTTON_POLL_INTERVAL_SECONDS)
     except KeyboardInterrupt:
         logging.info("Program interrupted by user. Exiting...")
     finally:
+        if button_trace is not None:
+            button_trace.close()
         bus.close()
         # Wait for this button worker before cleanup. Upstream capture may
         # still have separate background save/display threads; this is not
