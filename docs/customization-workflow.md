@@ -47,10 +47,12 @@ updater can then fast-forward to our reviewed custom releases rather than replac
 them with stock code. Until that tracking is configured, it may report divergence
 from stock upstream. Never discard changes to unlock installation.
 
-Keep pushing rights/credentials on the Mac only. Prefer guided SSH deployment
-with backups and acceptance tests even when the stock update button is available:
-it runs the dependency/service helper and is broader than a source-only patch.
-There are no unattended merges, installations, or update monitors.
+Keep camera-side access read-only. Prefer guided deployment with backups and
+acceptance tests even when the stock update button is available: it runs the
+dependency/service helper and is broader than a source-only patch. A scheduled
+[upstream preparation workflow](upstream-sync.md) now checks official upstream,
+merges new revisions into an automation-owned review branch, runs regression
+checks, and opens a pull request. It never merges or installs the result.
 
 ## Bringing in upstream updates
 
@@ -73,6 +75,11 @@ features, so compatibility cannot be guaranteed by simply dropping in a plug-in.
 5. After approval, advance `austin-camera` to the reviewed result. Back up the
    camera, transfer the release, compile with its interpreter, deploy while idle,
    and perform physical acceptance. Record the release commit and recovery path.
+
+The first four steps are now prepared by GitHub Actions when there is no merge
+conflict and the automated checks pass. The pull request remains the review gate;
+see [automated upstream update preparation](upstream-sync.md). The workflow does
+not change `austin-camera` directly and does not deploy to the physical camera.
 
 The stock updater refreshes dependencies/services as well as code; a source-only
 rollback cannot reliably undo an arbitrary full update. Do not assume its built-in

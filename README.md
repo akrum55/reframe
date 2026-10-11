@@ -13,6 +13,9 @@
 > owner's explicit opt-in, **experimental fast refresh is the custom default**;
 > Settings → Advanced → Screen Refresh can restore standard speed. Upstream has
 > not established long-term panel wear or color accuracy for fast timing.
+> Official upstream is checked automatically; new revisions are merged and tested
+> on a review branch and proposed as a pull request. Nothing is merged or installed
+> without review. See [automated upstream update preparation](docs/upstream-sync.md).
 
 <img src="docs/images/reframe-hero.jpg" alt="reFrame ePaper camera in hand" width="720" />
 

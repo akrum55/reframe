@@ -1,0 +1,111 @@
+name: Prepare upstream reFrame update
+
+on:
+  schedule:
+    - cron: "17 9 * * *"
+      timezone: "America/New_York"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-reframe-sync
+  cancel-in-progress: false
+
+jobs:
+  prepare-update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Clone the custom release branch
+        run: gh repo clone "$GITHUB_REPOSITORY" repo -- --branch austin-camera --single-branch
+
+      - name: Fetch official upstream
+        working-directory: repo
+        run: |
+          git remote add upstream https://github.com/kaloyaan/reframe.git
+          git fetch --no-tags upstream main
+          git fetch --no-tags origin austin-camera
+
+      - name: Check whether upstream is already included
+        id: check
+        working-directory: repo
+        shell: bash
+        run: |
+          if git merge-base --is-ancestor upstream/main origin/austin-camera; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Official upstream is already included in austin-camera."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "revision=$(git rev-parse --short=12 upstream/main)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge upstream into a review branch
+        if: steps.check.outputs.changed == 'true'
+        working-directory: repo
+        shell: bash
+        run: |
+          branch="automation/upstream-${{ steps.check.outputs.revision }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C "$branch" origin/austin-camera
+          if ! git merge --no-ff --no-edit upstream/main; then
+            git merge --abort
+            echo "The upstream merge has conflicts and needs manual review." >&2
+            exit 1
+          fi
+
+      - name: Install test dependencies
+        if: steps.check.outputs.changed == 'true'
+        working-directory: repo
+        run: |
+          python3 -m venv .venv-ci
+          .venv-ci/bin/python -m pip install --upgrade pip
+          .venv-ci/bin/python -m pip install -r requirements.txt
+
+      - name: Run regression checks
+        if: steps.check.outputs.changed == 'true'
+        working-directory: repo
+        run: |
+          .venv-ci/bin/python -m unittest discover -s tests -q
+          .venv-ci/bin/python -m compileall -q .
+          node --test tests/photo-library.test.cjs
+          git diff --check origin/austin-camera...HEAD
+
+      - name: Publish the review branch
+        if: steps.check.outputs.changed == 'true'
+        working-directory: repo
+        shell: bash
+        run: |
+          branch="automation/upstream-${{ steps.check.outputs.revision }}"
+          git fetch --no-tags origin "$branch" || true
+          if git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+            git push --force-with-lease="refs/heads/$branch:refs/remotes/origin/$branch" origin "HEAD:refs/heads/$branch"
+          else
+            git push --set-upstream origin "HEAD:refs/heads/$branch"
+          fi
+
+      - name: Open or refresh the upstream review pull request
+        if: steps.check.outputs.changed == 'true'
+        working-directory: repo
+        shell: bash
+        run: |
+          branch="automation/upstream-${{ steps.check.outputs.revision }}"
+          title="Review official reFrame update ${{ steps.check.outputs.revision }}"
+          body_file="$RUNNER_TEMP/upstream-pr.md"
+          {
+            echo "This pull request was prepared automatically from official upstream revision \`${{ steps.check.outputs.revision }}\`."
+            echo
+            echo "Automated checks passed before this pull request was opened. Review hardware, dependency, service, and configuration changes before merging. Merging only advances the public \`austin-camera\` release; it does not install anything on the camera."
+          } > "$body_file"
+          number="$(gh pr list --base austin-camera --head "$branch" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$number" ]; then
+            gh pr edit "$number" --title "$title" --body-file "$body_file"
+          else
+            gh pr create --base austin-camera --head "$branch" --title "$title" --body-file "$body_file"
+          fi
