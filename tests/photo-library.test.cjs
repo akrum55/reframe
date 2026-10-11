@@ -35,6 +35,99 @@ function library() {
     });
     return instance;
 }
+
+function selectionView(ids = ['00001']) {
+    const instance = library();
+    const listeners = new Map();
+    const buttons = ids.map(id => ({dataset: {photoChoice: id},
+        addEventListener(type, callback) { listeners.set(id, callback); },
+        setAttribute() {}, querySelector() { return {}; }}));
+    const grid = {innerHTML: '', querySelectorAll() { return buttons; }};
+    let galleryRenders = 0;
+    Object.assign(instance.options, {
+        grid: () => grid,
+        photos: () => ids.map(id => ({id, original_path: '/fixture.jpg'})),
+        activity() {},
+        render() {
+            galleryRenders++;
+            if (!PhotoLibrary.prototype.render.call(instance, grid))
+                grid.innerHTML = '<button>download original</button><button>download dithered</button>';
+        }
+    });
+    return {instance, grid, listeners, galleryRenders: () => galleryRenders};
+}
+
+test('removing the final selected photo restores the original gallery download controls', () => {
+    const view = selectionView();
+    view.instance.selection.addPage(['00001']);
+    PhotoLibrary.prototype.render.call(view.instance, view.grid);
+    view.listeners.get('00001')();
+    assert.equal(view.instance.selecting, false);
+    assert.equal(view.instance.selection.ids.size, 0);
+    assert.equal(view.galleryRenders(), 1);
+    assert.match(view.grid.innerHTML, /download original/);
+    assert.match(view.grid.innerHTML, /download dithered/);
+});
+
+test('clear selection restores the original gallery without reloading photos', async () => {
+    const view = selectionView();
+    view.instance.selection.addPage(['00001', 'off-page']);
+    view.instance.options.reload = () => { throw new Error('No reload needed'); };
+    await view.instance.action('clear');
+    assert.equal(view.instance.selecting, false);
+    assert.equal(view.instance.selection.ids.size, 0);
+    assert.match(view.grid.innerHTML, /download original/);
+});
+
+test('entering selection with no selected photos still allows the first selection', async () => {
+    const view = selectionView();
+    view.instance.selecting = false;
+    await view.instance.action('select');
+    assert.equal(view.instance.selecting, true);
+    assert.equal(view.instance.selection.ids.size, 0);
+    view.listeners.get('00001')();
+    assert.equal(view.instance.selecting, true);
+    assert.deepEqual([...view.instance.selection.ids], ['00001']);
+});
+
+test('deselecting the last photo on this page preserves off-page selections', () => {
+    const view = selectionView();
+    view.instance.selection.addPage(['00001', 'off-page']);
+    PhotoLibrary.prototype.render.call(view.instance, view.grid);
+    view.listeners.get('00001')();
+    assert.equal(view.instance.selecting, true);
+    assert.deepEqual([...view.instance.selection.ids], ['off-page']);
+    assert.equal(view.galleryRenders(), 0);
+});
+
+test('deselecting or clearing Trash keeps its restore interface', async () => {
+    const view = selectionView();
+    view.instance.trashView = true;
+    view.instance.trashPhotos = [{id: '00001', photo_id: 'fixture', trashed_at: 1}];
+    view.instance.selection.addPage(['00001']);
+    PhotoLibrary.prototype.render.call(view.instance, view.grid);
+    view.listeners.get('00001')();
+    assert.equal(view.instance.trashView, true);
+    assert.equal(view.instance.selecting, true);
+    assert.equal(view.galleryRenders(), 0);
+    view.instance.selection.addPage(['00001']);
+    await view.instance.action('clear');
+    assert.equal(view.instance.selecting, true);
+    assert.equal(view.instance.selection.ids.size, 0);
+});
+
+test('busy photo operations prevent both deselection and clear-selection exit', async () => {
+    const view = selectionView();
+    view.instance.selection.addPage(['00001']);
+    PhotoLibrary.prototype.render.call(view.instance, view.grid);
+    view.instance.busy = true;
+    view.listeners.get('00001')();
+    await view.instance.action('clear');
+    assert.equal(view.instance.selecting, true);
+    assert.deepEqual([...view.instance.selection.ids], ['00001']);
+    assert.equal(view.galleryRenders(), 0);
+});
+
 test('move uses only selected IDs, clears successful IDs, preserves partial failures for retry', async () => {
     const instance = library();
     instance.selection.addPage(['00001', '00002']);

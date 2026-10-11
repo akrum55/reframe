@@ -25,7 +25,10 @@ maintainer to empty the user's real Trash.
    and choose **restore selected**. Trash survives browser reloads and camera
    restarts. Undo is a convenience for the last batch in the current browser tab;
    opening Trash dismisses that message and Undo, including after returning to photos.
-4. **Cancel** leaves selection mode without changing any files.
+4. **Cancel**, **Clear selection**, or deselecting the last selected photo leaves
+   gallery selection mode without changing any files and restores the normal
+   download buttons. Starting selection with no photos selected still works.
+   Deselecting in Trash keeps the Trash/restore interface open.
 5. To free space, open **trash → empty trash**. Review the current count and the
    permanent-deletion warning, then confirm. This deletes all photos currently
    in Trash, not just selected cards. Active gallery photos are never included.

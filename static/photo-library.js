@@ -48,7 +48,17 @@
 
         visiblePhotos() { return this.trashView ? this.trashPhotos : this.options.photos(); }
 
+        exitEmptySelection() {
+            // Only called after user-driven deselection, not when entering selection mode.
+            if (!this.selecting || this.trashView || this.busy || this.selection.ids.size) return false;
+            this.selecting = false;
+            this.options.render(); // Restore the upstream cards and their download buttons.
+            this.renderToolbar();
+            return true;
+        }
+
         async action(action) {
+            if (this.busy) return;
             this.options.activity();
             if (action === 'trash' || action === 'gallery') {
                 this.loadVersion++;
@@ -73,7 +83,7 @@
                 this.render(this.options.grid());
             } else if (action === 'clear') {
                 this.selection.clear();
-                this.render(this.options.grid());
+                if (!this.exitEmptySelection()) this.render(this.options.grid());
             } else if (action === 'move') {
                 const count = this.selection.ids.size;
                 if (count && confirm(`Move ${count} photo${count === 1 ? '' : 's'} to Trash? Originals and processed copies stay together. You can restore them later.`)) {
@@ -152,6 +162,10 @@
                     }
                     this.selection.toggle(id);
                     const checked = this.selection.ids.has(id);
+                    if (!checked && this.exitEmptySelection()) {
+                        this.options.activity();
+                        return;
+                    }
                     button.setAttribute('aria-checked', String(checked));
                     button.querySelector('.photo-check').textContent = checked ? '✓' : '';
                     this.renderToolbar();
